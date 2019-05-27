@@ -1,0 +1,226 @@
+Import required packages
+
+```{r}
+library('tidyverse')
+library(RCurl)
+library(readr)
+library(nlme)
+library(lme4)
+library(caret)
+library(randomForest)
+library(mlbench)
+```
+
+Two quick functions to calculate root mean squared error (`rmse`) and mean absolute error (`mae`)
+```{r}
+rmse_calc <- function(y, pred){
+  return(round(sqrt(mean((y - pred)^2)),2))
+}
+
+mae_calc <- function(y, pred){
+  return(round(mean(abs(y - pred)),2))
+}
+```
+
+Function to import and clean data from Github
+1. Function to bring in data
+2. Remove wheelchair athletes to get homogeneous times
+  * this part needs to be checked
+3. Loop through years 2001:2014
+```{r}
+get_mar_data <- function(race_year){
+  mar_file = getURL(paste0("https://raw.githubusercontent.com/llimllib/bostonmarathon/master/results/",race_year,"/results.csv"))
+  return(read.csv(text = mar_file) %>%
+         mutate(year = race_year, official = as.numeric(official)) %>%
+         filter(!stringr::str_detect(bib,'W'), !is.na(official)) %>%
+           select(name, city, gender, age, official, state, country))
+}
+
+# loop through each year to build dataset
+baa <- get_mar_data(2001)
+for(mar_year in 2002:2014){
+  baa <- rbind(baa, get_mar_data(mar_year))
+  print(mar_year)
+}
+```
+
+Info also available as CSVs 
+1. Race data
+2. Ref tables:
+  * qualification times
+  * weather
+```{r}
+baa <- read_csv("baa_2001_2014.csv")
+BAA_qualifying_times <- read_csv("BAA_qualifying_times.csv")
+BAA_marathon_weather <- read_csv("BAA_marathon_weather.csv")
+```
+
+To set up data
+1. Bring in weather for each year, qualifying standards by age and gender
+2. Mark any blow-ups
+  * A run where time >30 minutes over qualifying time (gender-adjusted for that year's average time)
+  * Rough way to separate qualifiers on time from alternate qualifiers
+```{r}
+comps <- baa %>% mutate(match_var = 1) %>% 
+  full_join(BAA_qualifying_times %>% mutate(match_var = 1), by = 'match_var') %>%
+  filter(gender == Gender & age >= Min_age & age <= Max_age & year >= Min_year & year <= Max_year) %>%
+  mutate(official = as.numeric(official)) %>%
+  select(-c(match_var, Min_age, Max_age, Gender, Min_year, Max_year)) %>%
+  inner_join(BAA_marathon_weather, by = c('year'='Year')) %>%
+  group_by(gender) %>%
+  mutate(avg_gender = mean(official, na.rm = T)) %>%
+  group_by(gender, year) %>% 
+  mutate(avg_gender_yr = mean(official, na.rm = T)) %>%
+  ungroup() %>%
+  filter(!is.na(official)) %>%
+  mutate(adj_official = official * (avg_gender/avg_gender_yr)) %>%
+  mutate(non_comp = if_else(adj_official - Time > 30, 1, 0)) %>%
+  select(-c(avg_gender, avg_gender_yr, adj_official, X1))
+```
+Check for missing values, overall structure of dataset  
+```{r}
+sapply(comps, function(x) sum(is.na(x)))
+str(comps)
+```
+
+Create unique ID based on name, city, state, gender, country, and age at time of races
+* Last variable (age at time of races) should help for final differentiation
+```{r}
+distinct_ID <- comps %>% 
+  mutate(diff = year - age) %>%
+  select(name, city, state, gender, country, diff) %>%
+  group_by(name, city, gender, state, country, diff) %>% 
+  distinct() %>%
+  rowid_to_column(.,'ID') %>%
+  inner_join(comps, by = c('name','city','gender','country','state')) %>%
+  ungroup() %>% 
+  select(-c(city, state, diff, Time))
+```
+
+Create flags to identify subset of consistent qualifying runners, with progressively more stringent criteria:
+1. Fewer than 2 "blow-ups"
+2. At least 3 races
+3. At least one instance of consecutive years completing the race
+
+Due to the bombing in 2013, there were fewer runners who completed the race. To account for this, any slower runner (average > 4 hours) with no official result in 2013 but who had an official result in 2014 was given credit for running consecutive races.
+
+```{r}
+sqldf("select year, sum(case when gender = 'M' then 1 else 0 end) male, 
+       sum(case when gender = 'F' then 1 else 0 end) female, count(*) total
+       from bos_mar
+       group by year") %>% 
+  ggplot(., aes(year, total)) + 
+    geom_line() + ylab("Finishers") + 
+    xlab("Year") + 
+    ggtitle("Finishers per year") +
+    geom_abline(v = 2013, lty = 3)
+```
+
+```{r}
+bos_mar <- distinct_ID %>%
+  group_by(ID) %>%
+  mutate(sum_non_comp = sum(non_comp)) %>%
+  ungroup() %>%
+  mutate(qualifier = ifelse(sum_non_comp < 2, 1, 0)) %>% 
+  group_by(ID) %>%
+  mutate(race_tot = n(), avg_official = mean(official)) %>%
+  mutate(multiple_racer = ifelse(race_tot >= 3, 1, 0)) %>%
+  ungroup() %>%
+  arrange(ID, age, year) %>% 
+  mutate(consecutive_1 = ifelse(multiple_racer == 1 &
+                             qualifier == 1 &
+                             lead(ID) == ID & 
+                             lead(age) == age+1 & 
+                             lead(year) == year + 1, 1, 0)) %>%
+  mutate(consecutive_2 = ifelse(multiple_racer == 1 &
+                             qualifier == 1 &
+                             race_tot >= 2 &
+                             year == 2014 & 
+                             #avg_official > 200 &
+                             lag(ID) != ID, 1, 0)) %>%
+  mutate(has_repeat = ifelse(consecutive_1 + consecutive_2 >=1, 1, 0))
+```
+
+bos_mar %>% 
+  select(ID) %>% 
+  group_by(ID) %>% 
+  summarize(count = n()) %>% 
+  pull() %>% 
+  table(.) %>% barplot(col = 'maroon', main = 'Number of marathons per person')
+
+hist(bos_ID$year, xlab = 'Year', ylab = '', col = 'dodgerblue', main = '(Repeating) runners per year')
+
+# assess times by age + gender, split by year
+```{r}
+ggplot(bos_mar, aes(age, official, col = gender)) +
+  geom_point(alpha = .20) +
+  geom_smooth(method = 'lm', se = F, alpha = .15) +
+  geom_smooth(data = bos_mar, aes(age, official, color = consecutive_year)) +
+  facet_wrap(~year)
+```
+
+
+
+#### Predictions
+
+Start with simple predictions based on average values:
+1. Age (bins every 5 years from ~ 18 - 80+)
+2. Gender
+3. Country
+  * Several East African countries, as well as European countries, have some significantly below-average times
+```{r}
+bos_mar %>% 
+  mutate(age_bin = cut(age, c(0,18,25,30,35,40,45,50,55,60,65,70,75,80,110))) %>%
+  group_by(gender, age_bin, country) %>%
+  mutate(total_bin = n()) %>% 
+  mutate(avg_official = mean(official)) %>%
+  ungroup() %>%
+  # mutate(avg_official = ifelse(total_bin < 3, NA, mean(official))) %>%
+  # select(-total_bin) %>%
+  mutate(avg_resid = avg_official - official) %>%
+  summarize(mse = sqrt(mean(avg_resid^2, na.rm = T)), mae = mean(abs(avg_resid), na.rm = T))
+```
+
+# explanatory multilevel model using year
+ml_mod <- lmer(official ~ I(as.factor(year)) + gender * age + (1|ID), data = bos_mar)
+ml_mod_country <- lmer(official ~ I(as.factor(year)) + country + gender * age + (1|ID), data = bos_mar)
+
+plot(ml_mod)
+plot(predict(ml_mod), bos_mar$official - predict(ml_mod), col = 'dodgerblue')
+
+anova(ml_mod, ml_mod_country)
+
+# same model, different package
+summary(lme(official ~ I(as.factor(year)) + country + gender * age, data=bos_mar, random = ~ 1 | ID))
+
+# predictive model using weather
+ml_weather <- lmer(official ~ country + Finish_temp * age + Sky + Wind_effect + gender * age + (1|ID), data = bos_mar)
+plot(ml_weather)
+
+# error for explanatory model
+rmse_calc(bos_mar$official, predict(ml_mod_country))
+mae_calc(bos_mar$official, predict(ml_mod_country))
+
+# error for predictive model
+rmse_calc(bos_mar$official, predict(ml_weather))
+mae_calc(bos_mar$official, predict(ml_weather))
+
+# OLS model
+lm_mod <- lm(official ~ country + I(as.factor(year)) + gender * age, data = bos_mar)
+summary(lm_mod)
+rmse_calc(bos_mar$official, predict(lm_mod))
+mae_calc(bos_mar$official, predict(lm_mod))
+
+# predicting out of sample
+bos_01_13 <- bos_mar %>% filter(year != 2014)
+weather_13 <- lmer(official ~ Finish_temp * age + country + Sky + Wind_effect + gender * age + (1|ID), data = bos_01_13)
+bos_14 <- bos_mar %>% filter(year == 2014)
+rmse_calc(bos_14$official, predict(weather_13, bos_14))
+mae_calc(bos_14$official, predict(weather_13, bos_14))
+
+
+ran_for <- randomForest(official ~ country + Finish_temp * Sky * Wind_effect + gender * age, data = bos_mar %>% mutate_if(is.character, as.factor))
+ran_for_ID <- randomForest(official ~ country + Finish_temp * Sky * Wind_effect + gender * age + I(as.factor(ID)), data = bos_mar %>% mutate_if(is.character, as.factor))
+rmse_calc(bos_mar$official, predict(ran_for))
+mae_calc(bos_mar$official, predict(ran_for))
+
